@@ -1,5 +1,5 @@
 Grove Ultrasonic Ranger
 Raspberry Pi with SD card
 Arduino Uno Wifi R2
-Grove Starter Kit (comes with buzzer and oled diplay)
+Grove Starter Kit (comes with buzzer and grove-lcd RGB backlight)
 ECG hearth sensor sen0213
