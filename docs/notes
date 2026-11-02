@@ -2,3 +2,5 @@ Database where to store user inoformation so you can recognise it later, identif
 Hearth beat monitoring.
 Switch instead of FSR
 Add two warnings at the same time.
+Buzzer doesn't work when you're away.
+Distance sensor switches to away state when not detecting anything for 10s.
