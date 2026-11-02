@@ -1,3 +1,4 @@
 Database where to store user inoformation so you can recognise it later, identifying themselves using rfid or user/password.
 Hearth beat monitoring.
 Switch instead of FSR
+Add two warnings at the same time.
