@@ -6,6 +6,14 @@
   Short press on the button  = start / stop sitting
   Long press (2 s or more)   = start a 20 second ECG heart check
   Personal alerts from the Pi (sdg/alerts) are shown straight away
+
+  AWAY mode: if nobody is seen within 80 cm for 10 seconds, the desk
+  switches to "away" by itself (and stops the sitting timer). The buzzer
+  stays silent while away; the LCD and its colours keep working.
+  Coming back in front of the desk (or pressing the button) ends away.
+
+  Several warnings at once: the LCD shows them one after the other,
+  changing every 2 seconds, with "1/2", "2/2"... in front.
 */
 
 #include <WiFiNINA.h>          // WiFi on the Uno WiFi Rev2
@@ -24,6 +32,8 @@ const int MAX_SIT_MIN    = 45;   // sitting longer than this = stand up
 const int TOO_DARK       = 200;  // light value below this = too dark
 const int RESTING_BPM    = 75;   // your own resting heart rate
 const int BPM_MARGIN     = 15;   // alert if bpm > RESTING_BPM + BPM_MARGIN
+const int AWAY_CM        = 80;   // nobody closer than this...
+const unsigned long AWAY_AFTER_MS = 10000;  // ...for 10 s = away
 
 // ---------- 2. PINS (Grove Base Shield ports) ----------
 const int BUTTON_PIN     = 2;    // D2
@@ -44,7 +54,10 @@ int distance = 0;                   // cm, 0 = nobody detected
 int light = 0;                      // 0 (dark) to 1023 (bright)
 int lastBpm = 0;                    // result of the last ECG check
 unsigned long ecgDoneAt = 0;        // when the last ECG check ended
-bool hadAlert = false;              // was there an alert last time?
+byte lastWarnings = 0;              // which warnings were on last time (bits)
+int warningIndex = 0;               // which warning the LCD shows now
+bool away = false;                  // true = nobody at the desk
+unsigned long lastSeen = 0;         // last time someone was within AWAY_CM
 unsigned long lastSend = 0;         // last time we sent readings
 unsigned long lastReconnect = 0;    // last time we tried to reconnect
 
@@ -68,6 +81,7 @@ void setup() {
   lcd.print("Guardian...");
 
   connectWifiAndMqtt();
+  lastSeen = millis();              // start as "present"
 }
 
 // ======================================================
@@ -78,6 +92,7 @@ void loop() {
     lastSend = millis();
     distance = readDistance();
     light = analogRead(LIGHT_PIN);
+    checkAway();                     // switch to / from away
     showAndWarn();                   // LCD + buzzer
     sendReadings();                  // to the Pi
   }
@@ -99,6 +114,7 @@ void checkButton() {
   }
   if (button == LOW && lastButton == HIGH) {        // just released
     unsigned long held = millis() - pressedAt;
+    if (held > 50) markPresent();                   // someone pressed it, so they're here
     if (held >= 2000) {
       runEcgCheck();
     } else if (held > 50) {                         // ignore "bounces" under 50 ms
@@ -135,6 +151,32 @@ int readDistance() {
   return echoTime / 29 / 2;                 // 3. sound: 29 us per cm, there and back
 }
 
+// ---------- AWAY: nobody within AWAY_CM for AWAY_AFTER_MS ----------
+void checkAway() {
+  bool someoneHere = (distance > 0 && distance <= AWAY_CM);  // 0 = no echo = nobody
+  if (someoneHere) {
+    markPresent();
+  } else if (!away && millis() - lastSeen >= AWAY_AFTER_MS) {
+    away = true;
+    Serial.println("Away: nobody at the desk");
+    if (sitting) {                                  // they left: stop the sitting timer
+      sitting = false;
+      unsigned long seconds = (millis() - sitStart) / 1000;
+      publish("sdg/session", "{\"event\": \"stop\", \"duration_s\": " + String(seconds) + ", \"reason\": \"away\"}");
+    }
+    publish("sdg/session", "{\"event\": \"away\"}");
+  }
+}
+
+void markPresent() {
+  lastSeen = millis();
+  if (away) {
+    away = false;
+    Serial.println("Back at the desk");
+    publish("sdg/session", "{\"event\": \"back\"}");
+  }
+}
+
 // ---------- SITTING TIME in minutes ----------
 int sitMinutes() {
   if (!sitting) return 0;
@@ -142,35 +184,51 @@ int sitMinutes() {
 }
 
 // ---------- LCD + BUZZER ----------
-void showAndWarn() {
-  // A personal alert from the Pi stays on screen for 10 seconds
-  if (millis() < piAlertUntil) return;
+// Each warning has its own bit, so we can tell when a NEW one appears
+const byte W_CLOSE = 1, W_STAND = 2, W_DARK = 4, W_PI = 8;
 
-  String warning = "";
-  if (distance > 0 && distance < TOO_CLOSE_CM) warning = "Too close!";
-  else if (sitMinutes() >= MAX_SIT_MIN)        warning = "Stand up!";
-  else if (light < TOO_DARK)                   warning = "Too dark!";
+void showAndWarn() {
+  // 1. Collect ALL the warnings that are on right now (max 4)
+  String warnings[4];
+  int count = 0;
+  byte now = 0;
+  if (distance > 0 && distance < TOO_CLOSE_CM) { warnings[count++] = "Too close!"; now |= W_CLOSE; }
+  if (sitMinutes() >= MAX_SIT_MIN)             { warnings[count++] = "Stand up!";  now |= W_STAND; }
+  if (light < TOO_DARK)                        { warnings[count++] = "Too dark!";  now |= W_DARK;  }
+  if (millis() < piAlertUntil)                 { warnings[count++] = piAlertText;  now |= W_PI;    }
 
   // Line 1: the values
   lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print(String(distance) + "cm  " + (sitting ? String(sitMinutes()) + "min" : "standing"));
+  String state = away ? "away" : (sitting ? String(sitMinutes()) + "min" : "standing");
+  lcd.print(String(distance) + "cm  " + state);
 
-  // Line 2: warning, or OK
+  // Line 2: the warning(s), or OK
   lcd.setCursor(0, 1);
-  if (warning != "") {
-    lcd.setRGB(255, 0, 0);          // red
-    lcd.print(warning);
-    if (!hadAlert) beep(300);       // beep only when a NEW alert starts
-    hadAlert = true;
-  } else {
+  if (count == 0) {
     lcd.setRGB(0, 255, 0);          // green
     lcd.print("All good");
-    hadAlert = false;
+    warningIndex = 0;
+  } else {
+    lcd.setRGB(255, 0, 0);          // red
+    if (count == 1) {
+      lcd.print(warnings[0]);
+    } else {
+      // 2 or more: show the next one each time (every 2 s), e.g. "1/2 Too close!"
+      int i = warningIndex % count;
+      lcd.print(String(i + 1) + "/" + String(count) + " " + warnings[i]);
+      warningIndex++;
+    }
   }
+
+  // Beep once when a NEW sensor warning starts (the Pi alert has its own double beep)
+  byte newOnes = now & ~lastWarnings & (W_CLOSE | W_STAND | W_DARK);
+  if (newOnes) beep(300);
+  if (!away) lastWarnings = now;    // while away, wait: a warning still on when you come back beeps then
 }
 
 void beep(int ms) {
+  if (away) return;                 // nobody at the desk: stay silent
   digitalWrite(BUZZER_PIN, HIGH);
   delay(ms);
   digitalWrite(BUZZER_PIN, LOW);
@@ -237,6 +295,7 @@ void runEcgCheck() {
   }
   delay(4000);                                      // show the result for 4 s
   ecgRunning = false;
+  markPresent();                                    // they were at the desk the whole time
 }
 
 // ---------- PERSONAL ALERT FROM THE PI (runs as soon as one arrives) ----------
@@ -247,18 +306,15 @@ void onPiAlert(int messageSize) {
   }
   Serial.println("Pi alert: " + text);
 
-  if (text.indexOf("\"type\": \"heart\"") >= 0) piAlertText = "Heart rate high!";
-  else                                           piAlertText = "Take a break!";
+  // Short texts (max 12 letters) so "1/3 " still fits on the 16-letter line
+  if (text.indexOf("\"type\": \"heart\"") >= 0) piAlertText = "Heart high!";
+  else                                           piAlertText = "Take break!";
 
   if (ecgRunning) return;                           // don't disturb an ECG check
 
-  piAlertUntil = millis() + 10000;                  // keep it on the LCD for 10 s
-  lcd.clear();
-  lcd.setRGB(255, 0, 0);                            // red
-  lcd.print("Personal alert");
-  lcd.setCursor(0, 1);
-  lcd.print(piAlertText);
-  beep(300); delay(150); beep(300);                 // double beep = from the Pi
+  piAlertUntil = millis() + 10000;                  // keep it in the warning list for 10 s
+  showAndWarn();                                    // show it straight away, with any other warnings
+  beep(300); delay(150); beep(300);                 // double beep = from the Pi (silent when away)
 }
 
 // ---------- SEND TO THE PI ----------
@@ -269,6 +325,7 @@ void sendReadings() {
   String json = "{\"distance\": " + String(distance) +
                 ", \"light\": " + String(light) +
                 ", \"sitting\": " + (sitting ? "true" : "false") +
+                ", \"away\": " + (away ? "true" : "false") +
                 ", \"sit_minutes\": " + String(sitMinutes()) +
                 ", \"bpm\": " + String(bpm) + "}";
   publish("sdg/readings", json);
