@@ -8,8 +8,9 @@
   Personal alerts from the Pi (sdg/alerts) are shown straight away
 
   AWAY mode: if nobody is seen within 80 cm for 10 seconds, the desk
-  switches to "away" by itself (and stops the sitting timer). The buzzer
-  stays silent while away; the LCD and its colours keep working.
+  switches to "away" by itself (and stops the sitting timer).
+  Warnings only BEEP while sitting (never when standing or away);
+  the LCD and its colours keep showing them all the time.
   Coming back in front of the desk (or pressing the button) ends away.
 
   Several warnings at once: the LCD shows them one after the other,
@@ -32,6 +33,7 @@ const int MAX_SIT_MIN    = 45;   // sitting longer than this = stand up
 const int TOO_DARK       = 200;  // light value below this = too dark
 const int RESTING_BPM    = 75;   // your own resting heart rate
 const int BPM_MARGIN     = 15;   // alert if bpm > RESTING_BPM + BPM_MARGIN
+const int ECG_MIN_RANGE  = 50;   // ECG signal must move at least this much, or the pads are off
 const int AWAY_CM        = 80;   // nobody closer than this...
 const unsigned long AWAY_AFTER_MS = 10000;  // ...for 10 s = away
 
@@ -40,7 +42,7 @@ const int BUTTON_PIN     = 2;    // D2
 const int BUZZER_PIN     = 6;    // D6
 const int ULTRASONIC_PIN = 7;    // D7
 const int LIGHT_PIN      = A0;   // A0
-const int ECG_PIN        = A1;   // A1
+const int ECG_PIN        = A1;   // A1: ECG board A -> A1, + -> 5V, - -> GND
 // LCD -> any I2C port
 
 // ---------- 3. VARIABLES (the Arduino's memory) ----------
@@ -221,10 +223,15 @@ void showAndWarn() {
     }
   }
 
-  // Beep once when a NEW sensor warning starts (the Pi alert has its own double beep)
-  byte newOnes = now & ~lastWarnings & (W_CLOSE | W_STAND | W_DARK);
-  if (newOnes) beep(300);
-  if (!away) lastWarnings = now;    // while away, wait: a warning still on when you come back beeps then
+  // Beep once when a NEW sensor warning starts (the Pi alert has its own double beep).
+  // The buzzer is for SITTING only: standing or away = silent, the LCD still shows them.
+  if (sitting) {
+    byte newOnes = now & ~lastWarnings & (W_CLOSE | W_STAND | W_DARK);
+    if (newOnes) beep(300);
+    lastWarnings = now;
+  } else {
+    lastWarnings = 0;               // not sitting: forget them, so any still on beeps once when you sit
+  }
 }
 
 void beep(int ms) {
@@ -249,6 +256,7 @@ void runEcgCheck() {
   unsigned long intervalSum = 0;
   int beats = 0;
   int minV = 1023, maxV = 0;
+  bool wasAbove = false;                            // was the last sample above the threshold?
 
   while (millis() - start < 20000) {
     if (millis() - lastSample >= 5) {               // read 200 times per second
@@ -259,28 +267,36 @@ void runEcgCheck() {
         if (v < minV) minV = v;
         if (v > maxV) maxV = v;
       } else {
+        if (maxV - minV < ECG_MIN_RANGE) break;     // flat line: pads off or wiring wrong, stop early
         int threshold = minV + (maxV - minV) * 7 / 10;   // 70% of the way to the top
-        if (v > threshold && millis() - lastBeat > 300) { // a heartbeat peak
+        bool above = v > threshold;
+        // count a beat only when the signal CROSSES the threshold going up,
+        // so a signal stuck high is not counted as many beats
+        if (above && !wasAbove && millis() - lastBeat > 300) {
           if (lastBeat > 0) {
             intervalSum += millis() - lastBeat;     // time since the previous beat
             beats++;
           }
           lastBeat = millis();
         }
+        wasAbove = above;
       }
     }
     mqttClient.poll();
   }
 
+  int bpm = 0;
+  if (beats >= 5) bpm = 60000UL * beats / intervalSum;   // beats per minute
+
   lcd.clear();
-  if (beats < 5) {                                  // not enough clean beats
+  if (bpm < 40 || bpm > 180) {                      // too few beats or an impossible value
     lcd.setRGB(255, 120, 0);
     lcd.print("ECG failed");
     lcd.setCursor(0, 1);
     lcd.print("Check pads");
     lastBpm = 0;
   } else {
-    lastBpm = 60000UL * beats / intervalSum;        // beats per minute
+    lastBpm = bpm;
     ecgDoneAt = millis();
     lcd.print("Heart: " + String(lastBpm) + " bpm");
     lcd.setCursor(0, 1);
@@ -314,7 +330,7 @@ void onPiAlert(int messageSize) {
 
   piAlertUntil = millis() + 10000;                  // keep it in the warning list for 10 s
   showAndWarn();                                    // show it straight away, with any other warnings
-  beep(300); delay(150); beep(300);                 // double beep = from the Pi (silent when away)
+  if (sitting) { beep(300); delay(150); beep(300); } // double beep = from the Pi (only while sitting)
 }
 
 // ---------- SEND TO THE PI ----------
