@@ -1,6 +1,7 @@
-Database where to store user inoformation so you can recognise it later, identifying themselves using rfid or user/password.
+Database where to store user information so you can recognise it later, identifying themselves using rfid or user/password.
 Hearth beat monitoring.
 Switch instead of FSR
 Add two warnings at the same time.
 Buzzer doesn't work when you're away.
 Distance sensor switches to away state when not detecting anything for 10s.
+Sometimes it is away sometimes it is standing. Have to be fixed.

@@ -23,9 +23,9 @@
 #include "rgb_lcd.h"           // Grove LCD RGB Backlight
 
 // ---------- 1. SETTINGS: change these ----------
-const char WIFI_NAME[]     = "Mehdi’s iPhone";
+const char WIFI_NAME[]     = "Mehdi's iPhone";
 const char WIFI_PASSWORD[] = "Mehdi1234";
-const char BROKER[]        = "192.168.1.50";   // the Pi's IP address (ask Angel)
+const char BROKER[]        = "10.80.216.187";   // the Pi's IP address (ask Angel)
 const int  BROKER_PORT     = 1883;
 
 const int TOO_CLOSE_CM   = 50;   // closer than this = too close
