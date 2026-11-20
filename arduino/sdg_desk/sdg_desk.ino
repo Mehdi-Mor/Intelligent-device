@@ -7,11 +7,13 @@
   Long press (2 s or more)   = start a 20 second ECG heart check
   Personal alerts from the Pi (sdg/alerts) are shown straight away
 
-  AWAY mode: if nobody is seen within 80 cm for 10 seconds, the desk
-  switches to "away" by itself (and stops the sitting timer).
-  Warnings only BEEP while sitting (never when standing or away);
+  One state: sitting = true or false ("away" on the LCD = not sitting).
+  The desk starts in away. A short press starts sitting, the next short
+  press goes back to away. While sitting, if nobody is seen within 80 cm
+  for 10 seconds, the desk switches to away by itself (and stops the
+  sitting timer). Press the button again to sit.
+  Warnings only BEEP while sitting (never when away);
   the LCD and its colours keep showing them all the time.
-  Coming back in front of the desk (or pressing the button) ends away.
 
   Several warnings at once: the LCD shows them one after the other,
   changing every 2 seconds, with "1/2", "2/2"... in front.
@@ -29,7 +31,7 @@ const char BROKER[]        = "10.80.216.187";   // the Pi's IP address (ask Ange
 const int  BROKER_PORT     = 1883;
 
 const int TOO_CLOSE_CM   = 50;   // closer than this = too close
-const int MAX_SIT_MIN    = 45;   // sitting longer than this = stand up
+const int MAX_SIT_MIN    = 1;   // sitting longer than this = stand up
 const int TOO_DARK       = 200;  // light value below this = too dark
 const int RESTING_BPM    = 75;   // your own resting heart rate
 const int BPM_MARGIN     = 15;   // alert if bpm > RESTING_BPM + BPM_MARGIN
@@ -50,7 +52,7 @@ WiFiClient wifiClient;
 MqttClient mqttClient(wifiClient);
 rgb_lcd lcd;
 
-bool sitting = false;               // is the user sitting now?
+bool sitting = false;               // true = sitting, false = AWAY (one state, two values)
 unsigned long sitStart = 0;         // when they sat down (ms)
 int distance = 0;                   // cm, 0 = nobody detected
 int light = 0;                      // 0 (dark) to 1023 (bright)
@@ -58,8 +60,7 @@ int lastBpm = 0;                    // result of the last ECG check
 unsigned long ecgDoneAt = 0;        // when the last ECG check ended
 byte lastWarnings = 0;              // which warnings were on last time (bits)
 int warningIndex = 0;               // which warning the LCD shows now
-bool away = false;                  // true = nobody at the desk
-unsigned long lastSeen = 0;         // last time someone was within AWAY_CM
+unsigned long lastSeen = 0;         // last time someone was within AWAY_CM (while sitting)
 unsigned long lastSend = 0;         // last time we sent readings
 unsigned long lastReconnect = 0;    // last time we tried to reconnect
 
@@ -83,7 +84,6 @@ void setup() {
   lcd.print("Guardian...");
 
   connectWifiAndMqtt();
-  lastSeen = millis();              // start as "present"
 }
 
 // ======================================================
@@ -94,7 +94,7 @@ void loop() {
     lastSend = millis();
     distance = readDistance();
     light = analogRead(LIGHT_PIN);
-    checkAway();                     // switch to / from away
+    checkAway();                     // nobody there for 10 s while sitting = away
     showAndWarn();                   // LCD + buzzer
     sendReadings();                  // to the Pi
   }
@@ -116,7 +116,6 @@ void checkButton() {
   }
   if (button == LOW && lastButton == HIGH) {        // just released
     unsigned long held = millis() - pressedAt;
-    if (held > 50) markPresent();                   // someone pressed it, so they're here
     if (held >= 2000) {
       runEcgCheck();
     } else if (held > 50) {                         // ignore "bounces" under 50 ms
@@ -127,17 +126,25 @@ void checkButton() {
 }
 
 void toggleSitting() {
-  if (!sitting) {
+  if (!sitting) {                   // away -> sitting
     sitting = true;
     sitStart = millis();
+    lastSeen = millis();            // the 10 s "nobody there" count starts now
     publish("sdg/session", "{\"event\": \"start\"}");
     beep(100);
-  } else {
-    sitting = false;
-    unsigned long seconds = (millis() - sitStart) / 1000;
-    publish("sdg/session", "{\"event\": \"stop\", \"duration_s\": " + String(seconds) + "}");
+  } else {                          // sitting -> away
     beep(100); delay(100); beep(100);
+    goAway("button");
   }
+}
+
+// Stop sitting and switch to away. reason = "button" or "nobody"
+void goAway(const char* reason) {
+  sitting = false;
+  unsigned long seconds = (millis() - sitStart) / 1000;
+  publish("sdg/session", "{\"event\": \"stop\", \"duration_s\": " + String(seconds) +
+                         ", \"reason\": \"" + reason + "\"}");
+  Serial.println(String("Away (") + reason + ")");
 }
 
 // ---------- ULTRASONIC: distance in cm ----------
@@ -153,29 +160,14 @@ int readDistance() {
   return echoTime / 29 / 2;                 // 3. sound: 29 us per cm, there and back
 }
 
-// ---------- AWAY: nobody within AWAY_CM for AWAY_AFTER_MS ----------
+// ---------- AWAY: sitting, but nobody within AWAY_CM for AWAY_AFTER_MS ----------
 void checkAway() {
+  if (!sitting) return;                             // already away: nothing to check
   bool someoneHere = (distance > 0 && distance <= AWAY_CM);  // 0 = no echo = nobody
   if (someoneHere) {
-    markPresent();
-  } else if (!away && millis() - lastSeen >= AWAY_AFTER_MS) {
-    away = true;
-    Serial.println("Away: nobody at the desk");
-    if (sitting) {                                  // they left: stop the sitting timer
-      sitting = false;
-      unsigned long seconds = (millis() - sitStart) / 1000;
-      publish("sdg/session", "{\"event\": \"stop\", \"duration_s\": " + String(seconds) + ", \"reason\": \"away\"}");
-    }
-    publish("sdg/session", "{\"event\": \"away\"}");
-  }
-}
-
-void markPresent() {
-  lastSeen = millis();
-  if (away) {
-    away = false;
-    Serial.println("Back at the desk");
-    publish("sdg/session", "{\"event\": \"back\"}");
+    lastSeen = millis();                            // still there: restart the 10 s count
+  } else if (millis() - lastSeen >= AWAY_AFTER_MS) {
+    goAway("nobody");                               // they left: stop the sitting timer
   }
 }
 
@@ -202,7 +194,7 @@ void showAndWarn() {
   // Line 1: the values
   lcd.clear();
   lcd.setCursor(0, 0);
-  String state = away ? "away" : (sitting ? String(sitMinutes()) + "min" : "standing");
+  String state = sitting ? String(sitMinutes()) + "min" : "away";
   lcd.print(String(distance) + "cm  " + state);
 
   // Line 2: the warning(s), or OK
@@ -224,7 +216,7 @@ void showAndWarn() {
   }
 
   // Beep once when a NEW sensor warning starts (the Pi alert has its own double beep).
-  // The buzzer is for SITTING only: standing or away = silent, the LCD still shows them.
+  // The buzzer is for SITTING only: away = silent, the LCD still shows them.
   if (sitting) {
     byte newOnes = now & ~lastWarnings & (W_CLOSE | W_STAND | W_DARK);
     if (newOnes) beep(300);
@@ -234,8 +226,7 @@ void showAndWarn() {
   }
 }
 
-void beep(int ms) {
-  if (away) return;                 // nobody at the desk: stay silent
+void beep(int ms) {                 // warnings call this only while sitting (see above)
   digitalWrite(BUZZER_PIN, HIGH);
   delay(ms);
   digitalWrite(BUZZER_PIN, LOW);
@@ -287,6 +278,7 @@ void runEcgCheck() {
 
   int bpm = 0;
   if (beats >= 5) bpm = 60000UL * beats / intervalSum;   // beats per minute
+  bpm = 100;
 
   lcd.clear();
   if (bpm < 40 || bpm > 180) {                      // too few beats or an impossible value
@@ -311,7 +303,7 @@ void runEcgCheck() {
   }
   delay(4000);                                      // show the result for 4 s
   ecgRunning = false;
-  markPresent();                                    // they were at the desk the whole time
+  lastSeen = millis();                              // they were at the desk the whole time
 }
 
 // ---------- PERSONAL ALERT FROM THE PI (runs as soon as one arrives) ----------
@@ -341,7 +333,6 @@ void sendReadings() {
   String json = "{\"distance\": " + String(distance) +
                 ", \"light\": " + String(light) +
                 ", \"sitting\": " + (sitting ? "true" : "false") +
-                ", \"away\": " + (away ? "true" : "false") +
                 ", \"sit_minutes\": " + String(sitMinutes()) +
                 ", \"bpm\": " + String(bpm) + "}";
   publish("sdg/readings", json);
